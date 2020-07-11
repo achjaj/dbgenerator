@@ -1,27 +1,29 @@
-import org.json.JSONArray;
-import org.json.JSONObject;
 import org.xml.sax.Attributes;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.DefaultHandler;
 
-import java.io.FileWriter;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HashMap;
 
 public class Generator extends DefaultHandler {
-    private HashMap<String, ArrayList<JSONObject>> groups = new HashMap<>();
-    private Path dest;
-    private boolean unihan;
+    private HashMap<String, ArrayList<String>> groups = new HashMap<>();
+    private String flavour;
+    private String unicodeVersion;
+    private boolean description = false;
 
-    public Generator(String writeTo, boolean unihan) throws IOException {
-        dest = Path.of(writeTo);
-        this.unihan = unihan;
+    private final Connection connection;
+    private final Statement statement;
 
-        if (!Files.exists(dest) || !Files.isDirectory(dest))
-            Files.createDirectory(dest);
+
+    public Generator(String writeTo, String flavour) throws SQLException {
+        this.flavour = flavour;
+
+        connection = DriverManager.getConnection("jdbc:sqlite:" + writeTo);
+        statement = connection.createStatement();
     }
 
     private String getStringAttribute(String name, Attributes attributes) {
@@ -30,54 +32,75 @@ public class Generator extends DefaultHandler {
     }
 
     private String getName(Attributes attributes) {
-        String name = attributes.getValue(Tags.XML.NAME);
+        String name = attributes.getValue(Generator.Tags.NAME);
         if (name == null || name.isEmpty())
-            name = getStringAttribute(Tags.XML.ALT_NAME, attributes);
+            name = getStringAttribute(Generator.Tags.ALT_NAME, attributes);
 
         return name;
     }
 
-    private JSONObject getCharObject(Attributes attributes) {
-        JSONObject obj = new JSONObject();
+    private String[] getCharObject(Attributes attributes) {
+        String[] info = new String[2];
 
-        String value = getStringAttribute(Tags.XML.VALUE, attributes);
+        String value = getStringAttribute(Generator.Tags.VALUE, attributes);
         String name = getName(attributes);
-        String group = unihan ? "unihan" : getStringAttribute(Tags.XML.GROUP, attributes);
-        String block = getStringAttribute(Tags.XML.BLOCK, attributes);
-        String emoji = attributes.getValue(Tags.XML.EMOJI);
+        String group = flavour.equals("unihan") ? "unihan" : getStringAttribute(Generator.Tags.GROUP, attributes);
+        String block = getStringAttribute(Generator.Tags.BLOCK, attributes);
+        String emojiStr = attributes.getValue(Generator.Tags.EMOJI);
 
-        obj.put(Tags.JSON.BLOCK, block);
-        obj.put(Tags.JSON.GROUP, group);
-        obj.put(Tags.JSON.NAME, name);
-        obj.put(Tags.JSON.VALUE, value);
-        obj.put(Tags.JSON.EMOJI, emoji != null && emoji.toLowerCase().equals("y"));
+        int emoji;
+        if (emojiStr == null)
+            emoji = 0;
+        else
+            emoji = emojiStr.toLowerCase().equals("y") ? 1 : 0;
 
-        return obj;
-    }
+        info[0] = String.format("INSERT INTO %s(value, name, groupName, block, emoji)" +
+                "VALUES('%s', '%s', '%s', '%s', %d)", group, value, name, group, block, emoji);
+        info[1] = group;
 
-    private void write(JSONObject obj, Path dest) throws IOException {
-        FileWriter writer = new FileWriter(dest.toFile());
-        obj.write(writer, 4, 0);
-        writer.close();
+        return info;
     }
 
     @Override
     public void startElement(String uri, String localName, String qName, Attributes attributes) throws SAXException {
         super.startElement(uri, localName, qName, attributes);
 
-        if (qName.equals(Tags.XML.QNAME)) {
-            JSONObject charObj = getCharObject(attributes);
+        if (qName.equals(Generator.Tags.QNAME)) {
+            String[] charInf = getCharObject(attributes);
 
-            String group = charObj.getString(Tags.JSON.GROUP);
+            String group = charInf[1];
             if (groups.containsKey(group)) {
-                groups.get(group).add(charObj);
+                groups.get(group).add(charInf[0]);
             }
             else {
-                ArrayList<JSONObject> chars = new ArrayList<>();
-                chars.add(charObj);
+                ArrayList<String> chars = new ArrayList<>();
+                chars.add(charInf[0]);
                 groups.put(group, chars);
             }
 
+        } else if (qName.equals(Tags.VER_FIELD)) {
+            description = true;
+        }
+    }
+
+    @Override
+    public void endElement(String uri, String localName, String qName) throws SAXException {
+        super.endElement(uri, localName, qName);
+
+        if (qName.equals(Tags.VER_FIELD))
+            description = false;
+    }
+
+    @Override
+    public void characters(char[] ch, int start, int length) throws SAXException {
+        super.characters(ch, start, length);
+
+        /*int now = start + length;
+        double percent = (double)now / ch.length * 100;
+        System.out.printf("[%d/%d] %3.0f%%\r", now, ch.length, percent);*/
+
+        if (description) {
+            unicodeVersion = new String(ch).substring(start, start + length).split(" ")[1];
         }
     }
 
@@ -85,38 +108,50 @@ public class Generator extends DefaultHandler {
     public void endDocument() throws SAXException {
         super.endDocument();
 
-        groups.forEach((groupName, chars) -> {
-            JSONObject group = new JSONObject();
-            group.put(Tags.JSON.NAME, groupName);
-            group.put(Tags.JSON.CHARS, new JSONArray(chars));
+        try {
+            write();
+            writeMeta();
+            statement.close();
+            connection.close();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
 
-            try {
-                write(group, Path.of(dest.toString(), groupName));
-            } catch (IOException e) {
-                e.printStackTrace();
+    }
+
+    private void write() throws SQLException {
+        int counter = 0;
+        int size = groups.values().stream().mapToInt(ArrayList::size).sum();
+
+        for (String group : groups.keySet()) {
+            statement.execute("DROP TABLE IF EXISTS " + group);
+            statement.execute("CREATE TABLE " + group + "(value TEXT, name TEXT, groupName TEXT, block TEXT, emoji INTEGER)");
+
+            var cmds = groups.get(group);
+            for (String cmd : cmds) {
+                counter++;
+                System.out.printf("Writing symbol: [%d/%d] %3.0f%%\r", counter, size, (double)counter / size * 100);
+                statement.execute(cmd);
             }
-        });
+        }
+        System.out.println("\nDone!");
+    }
+
+    private void writeMeta() throws SQLException {
+        statement.execute("DROP TABLE IF EXISTS meta");
+        statement.execute("CREATE TABLE meta (gVersion TEXT, uVersion TEXT, flavour TEXT)");
+        String VERSION = "0.1";
+        statement.execute(String.format("INSERT INTO meta(gVersion, uVersion, flavour) VALUES('%s', '%s', '%s')", VERSION, unicodeVersion, flavour));
     }
 
     private static class Tags {
-        private static class XML {
-            private static final String QNAME = "char",
-                                        GROUP = "gc",
-                                        VALUE = "cp",
-                                        NAME = "na",
-                                        ALT_NAME = "na1",
-                                        BLOCK = "blk",
-                                        EMOJI = "Emoji";
-        }
-
-        private static class JSON {
-            private static final String GROUP = "group",
-                                        VALUE = "value",
-                                        NAME = "name",
-                                        BLOCK = "block",
-                                        EMOJI = "emoji",
-                                        CHARS = "symbols";
-        }
-
+        private static final String QNAME = "char",
+                GROUP = "gc",
+                VALUE = "cp",
+                NAME = "na",
+                ALT_NAME = "na1",
+                BLOCK = "blk",
+                EMOJI = "Emoji",
+                VER_FIELD = "description";
     }
 }

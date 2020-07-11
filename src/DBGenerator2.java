@@ -80,7 +80,7 @@ public class DBGenerator2 {
         unzip(getXMLName(flavour));
 
         System.out.println("Generating JSON");
-        SAXParserFactory.newInstance().newSAXParser().parse(XML_NAME, new Generator(dest, flavour.equals("unihan")));
+        SAXParserFactory.newInstance().newSAXParser().parse(XML_NAME, new Generator2(dest, flavour.equals("unihan")));
     }
 
     private static void writeMeta(String dest, String flavour) throws IOException {

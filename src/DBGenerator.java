@@ -1,186 +1,101 @@
-import org.xml.sax.Attributes;
 import org.xml.sax.SAXException;
-import org.xml.sax.helpers.DefaultHandler;
 
+import javax.swing.*;
+import javax.xml.parsers.ParserConfigurationException;
 import javax.xml.parsers.SAXParserFactory;
+import java.io.BufferedInputStream;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.file.*;
-import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
-import java.sql.Statement;
-import java.util.concurrent.TimeUnit;
 
-public class DBGenerator extends DefaultHandler {
-    private final Connection connection;
-    private final Statement statement;
-    private final boolean unihan;
+public class DBGenerator {
 
-    public DBGenerator(boolean unihan) throws SQLException, IOException {
-        this.unihan = unihan;
+    private static final String BASE_NAME = "ucd.%s.flat";
+    private static final String BASE_URL = "http://www.unicode.org/Public/UCD/latest/ucdxml/%s.zip";
+    private static final Path ZIP_PATH = Paths.get("unicode.zip");
+    private static final String XML_NAME = "table.xml";
 
-        connection = DriverManager.getConnection("jdbc:sqlite:" + getResource("symbols.db"));
-        statement = connection.createStatement();
+    private static void printHelp() {
+        System.err.println("Usage: dbgenerator unihan|nounihan|all [d] [dest]\n" +
+                "\td - download only" +
+                "\tdest - output directory (./db is default)");
+        System.exit(1);
+    }
 
-        var groups = getValidAcronyms();
+    private static String getSource(String flavour) {
+        String name = String.format(BASE_NAME, flavour);
+        return String.format(BASE_URL, name);
+    }
 
-        for (var group : groups) {
-            statement.execute("DROP TABLE IF EXISTS " + group);
-            statement.execute(String.format("CREATE TABLE %s (value TEXT, name TEXT, groupName TEXT, block TEXT, emoji INTEGER)", group));
+    private static String getXMLName(String flavour) {
+        return String.format(BASE_NAME, flavour) + ".xml";
+    }
+
+    private static boolean zipExists() {
+        return Files.exists(ZIP_PATH) && Files.isRegularFile(ZIP_PATH);
+    }
+
+    private static void download(String source) throws IOException {
+        System.out.printf("Downloading '%s' to '%s'\n", source, ZIP_PATH.toString());
+
+        HttpURLConnection connection = (HttpURLConnection) new URL(source).openConnection();
+        long fs = connection.getContentLengthLong();
+        long ds = 0;
+
+        FileOutputStream out = new FileOutputStream(ZIP_PATH.toFile());
+        BufferedInputStream in = new BufferedInputStream(connection.getInputStream());
+
+        byte[] buffer = new byte[1024];
+        int x = 0;
+        while ((x = in.read(buffer, 0, 1024)) >= 0) {
+            ds += x;
+
+            out.write(buffer, 0, x);
+
+            double progress = (double)ds/fs * 100;
+            System.out.printf("Progress: [%d/%d] %3.0f%%\r", ds, fs, progress);
+        }
+        System.out.println();
+
+        out.close();
+        in.close();
+        connection.disconnect();
+    }
+
+    private static void unzip(String name) throws IOException {
+        System.out.println("Extracting XML");
+
+        try (var fs = FileSystems.newFileSystem(ZIP_PATH, (ClassLoader) null)) {
+            var zipSource = fs.getPath(name);
+            Files.copy(zipSource, Paths.get(XML_NAME), StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
-    private String getResource(String name) {
-        return "src/main/resources/" + name;
-    }
+    private static void doIt(boolean downloadOnly, String flavour, String dest) throws IOException, ParserConfigurationException, SAXException, SQLException {
+        if (!zipExists())
+            download(getSource(flavour));
 
-    private String[] getValidAcronyms() throws IOException {
-        if (unihan)
-            return new String[] {"unihan"};
+        if (!downloadOnly) {
+            unzip(getXMLName(flavour));
 
-        return Files.readAllLines(Path.of(getResource("groups.csv")))
-                .stream()
-                .map(line -> line.split(";")[0])
-                .toArray(String[]::new);
-    }
-
-    private String getStringAttribute(String name, Attributes attributes) {
-        var str = attributes.getValue(name);
-        return str == null ? "<NULL>" : str;
-    }
-
-    @Override
-    public void startElement(String uri, String localName, String qName, Attributes attributes) throws SAXException {
-        super.startElement(uri, localName, qName, attributes);
-
-        if (qName.equals("char")) {
-            var group = unihan ? "unihan" : getStringAttribute("gc", attributes);
-            var value = getStringAttribute("cp", attributes);
-
-            var name = attributes.getValue("na");
-            if (name == null || name.isEmpty())
-                name = getStringAttribute("na1", attributes);
-
-            var block = getStringAttribute("blk", attributes);
-
-            var emojiStr = attributes.getValue("Emoji");
-            int emoji;
-            if (emojiStr == null)
-                emoji = 0;
-            else
-                emoji = emojiStr.toLowerCase().equals("y") ? 1 : 0;
-
-            var cmd = String.format("INSERT INTO %s(value, name, groupName, block, emoji)" +
-                    "VALUES('%s', '%s', '%s', '%s', %d)", group, value, name, group, block, emoji);
-
-            try {
-                statement.execute(cmd);
-            } catch (SQLException e) {
-                e.printStackTrace();
-            }
-
-            //System.out.printf("Parsed: U+%s %s from group %s%n", attributes.getValue("cp"), name, group);
-        }
-
-    }
-
-    @Override
-    public void endDocument() throws SAXException {
-        super.endDocument();
-
-        try {
-            statement.close();
-            connection.close();
-        } catch (SQLException e) {
-            e.printStackTrace();
+            System.out.println("Parsing XML");
+            SAXParserFactory.newInstance().newSAXParser().parse(XML_NAME, new Generator(dest, flavour));
         }
     }
 
-    public static void main(String... args) throws Exception {
-        if (args.length < 1 || !args[0].matches("all|unihan|nounihan")) {
-            System.err.println("Usage: dbgenerator unihan|nounihan|all [d]\n" +
-                    "\td - download only");
-            System.exit(1);
-        }
+    public static void main(String[] args) throws ParserConfigurationException, SAXException, SQLException, IOException {
+        if (args.length < 1 || !args[0].matches("all|unihan|nounihan"))
+            printHelp();
 
         boolean dOnly = args.length >= 2 && args[1].equals("d");
-        var base = "ucd." + args[0] + ".flat";
-        var source = "http://www.unicode.org/Public/UCD/latest/ucdxml/" + base + ".zip";
-        var zipPath = Path.of("unicode.zip");
 
-        if (!Files.exists(zipPath) || !Files.isRegularFile(zipPath)) {
-            System.out.println("Downloading zip: " + source);
-            download(source, zipPath);
-        }
-
-        if (dOnly)
-            System.exit(0);
-
-        var xmlPath = Path.of(base + ".xml");
-        if (!Files.exists(xmlPath) || !Files.isRegularFile(xmlPath)) {
-            System.out.println("Extracting");
-            unzip(zipPath, base + ".xml");
-        }
-
-        System.out.println("Generating DB");
-        System.out.println("This may take a while.");
-        SAXParserFactory.newInstance().newSAXParser().parse(xmlPath.toFile(), new DBGenerator(args[0].equals("unihan")));
-
-        System.out.println("Modifying sources");
-        setVariant(args[0]);
+        String dest = (args.length < 2 || (dOnly && args.length == 2)) ? "db" : (dOnly ? args[2] : args[1]);
+        doIt(dOnly, args[0], dest);
     }
 
-    private static void download(String source, Path to) throws IOException {
-        HttpURLConnection connection = (HttpURLConnection) new URL(source).openConnection();
-        try(var input = connection.getInputStream()) {
-            var output = new FileOutputStream(to.toFile());
 
-            int bf = 1024;
-            int size = connection.getContentLength();
-            int written = 0;
-            long start = System.nanoTime();
-            while (written <= size) {
-                long bufferStart = System.nanoTime();
-                output.write(input.readNBytes(bf));
-                long bufferEnd = System.nanoTime();
-                long speed = bf/(bufferEnd - bufferStart);
-                written += bf;
-
-                System.out.printf("[%d/%d] %d%% [%s/%s] %d MB/s\r",
-                        written,
-                        size,
-                        (written/size)*100,
-                        formatTime(bufferEnd - start),
-                        speed != 0 ? formatTime(size/speed) : "?",
-                        speed);
-            }
-            System.out.println();
-            output.flush();
-            output.close();
-        }
-    }
-
-    private static String formatTime(long millis) {
-        var unit = TimeUnit.NANOSECONDS;
-        return String.format("%02d min, %02d sec",
-                unit.toMinutes(millis),
-                unit.toSeconds(millis) -
-                        TimeUnit.MINUTES.toSeconds(unit.toMinutes(millis))
-        );
-    }
-
-    private static void unzip(Path source, String name) throws IOException {
-        try (var fs = FileSystems.newFileSystem(source, (ClassLoader) null)) {
-            var zipSource = fs.getPath(name);
-            Files.copy(zipSource, Paths.get(name));
-        }
-    }
-
-    private static void setVariant(String variant) throws IOException {
-        var path = Path.of("src/main/java/com/velitar/unilookup/UniLookup.java");
-        Files.writeString(path, Files.readString(path).replace("%var%", variant));
-    }
 }
